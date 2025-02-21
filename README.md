@@ -17,46 +17,60 @@ pip install git+https://github.com/simleek/stripencode.git
 Here's how you can train a video compressor with your webcam:
 
 ```python
-    import time
-    from torch import optim
-    from stripencode.webcam_capture import WebcamCapture
+import time
+import torch
+from stripencode import StripEncoder2D
+from torch import optim
+from stripencode.webcam_capture import WebcamCapture
+import cv2
+import numpy as np
 
-    resolution = (1280, 720)
+resolution = (640, 360)
 
-    # Initialize model, optimizer
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = PyramidCompressionNet(in_channels=3, hidden_channels=16, image_size=resolution).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=5e-6)  # Smaller LR for longer training cycles
+# Initialize model, optimizer
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = StripEncoder2D(in_channels=3, hidden_channels=5, image_size=resolution).to(device)
+optimizer = optim.Adam(model.parameters(), lr=5e-3)  # Smaller LR for longer training cycles
 
-    # Training loop with while loop (user can exit with Ctrl + C)
-    step = 0
-    try:
-        with WebcamCapture(*resolution, 0) as webcam:
-            while True:
-                start_time = time.time()
+# Training loop with while loop (user can exit with Ctrl + C)
+step = 0
+try:
+    with WebcamCapture(*resolution, 0) as webcam:
+        while True:
+            start_time = time.time()
 
-                frame_tensor = webcam.get_frame(resolution)
+            frame_tensor = webcam.get_frame(resolution)
 
-                image = frame_tensor.to(device)
-                sparse_h, pyramid_info, loss = model(image)
+            image = frame_tensor.to(device)
+            sparse_h, pyramid_info, loss, reproduction = model(image)
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-                # Compute memory savings
-                original_size = image.element_size() * image.nelement()  # Uncompressed tensor size
-                sparse_size = sparse_h._nnz() * sparse_h.element_size()  # Only non-zero elements
-                compression_ratio = sparse_size / original_size
+            # Compute memory savings
+            original_size = image.element_size() * image.nelement()  # Uncompressed tensor size
+            sparse_size = sparse_h._nnz() * sparse_h.element_size()  # Only non-zero elements
+            compression_ratio = sparse_size / original_size
 
-                print(
-                    f"Step {step} | Loss: {loss.item():.6f} | Compression Ratio: {compression_ratio:.4f} | Time per step: {time.time() - start_time:.3f}s")
+            print(
+                f"Step {step} | Loss: {loss.item():.6f} | Compression Ratio: {compression_ratio:.4f}'{sparse_h._nnz()} | Time per step: {time.time() - start_time:.3f}s")
 
-                step += 1
+            o = (frame_tensor.detach().cpu().squeeze(0).permute(1,2,0).numpy()*255).astype(np.uint8)
+            r = (reproduction.detach().cpu().squeeze(0).permute(1,2,0).numpy()*255).astype(np.uint8)
+            cv2.imshow("Original | Reproduction", np.hstack([o, r]))
+            cv2.waitKey(1)
+            step += 1
 
-    except KeyboardInterrupt:
-        print("\nTraining stopped by user.")
+except KeyboardInterrupt:
+    print("\nTraining stopped by user.")
+
 ```
+
+## Todo
+
+* Fix the border
+  * I used 3x3 convolutions with padding because it was easy, but removing padding will fix the border. However, at small sizes when width or height is smaller than 3, the 3x3 needs to be reduced to width x height 
 
 ## Documentation
 

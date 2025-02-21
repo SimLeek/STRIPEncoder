@@ -37,6 +37,8 @@ class RecurrentCNN(nn.Module):
         # conv bias is true by default
         # we need that to backprop to the zero initialized hidden state from zero initialized weights
         self.conv = nn.Conv2d(in_channels + hidden_channels, hidden_channels, kernel_size=3, padding=1)
+        nn.init.zeros_(self.conv.weight)
+        nn.init.zeros_(self.conv.bias)
         self.leaky_relu = nn.LeakyReLU()  # with normal ReLU, negative values get zeroed out and stop learning
         self.reset_hidden_state()
 
@@ -45,18 +47,23 @@ class RecurrentCNN(nn.Module):
         self.h = torch.zeros(1, self.hidden_channels, *self.image_size)
 
     def forward(self, x):
+        if self.h.device != x.device:
+            self.h = self.h.to(x.device)
         x_h = torch.cat([x, self.h], dim=1)
         h_new = self.conv(x_h)
         h_new = self.leaky_relu(h_new)
         h_new = torch.clamp(h_new, -1, 1)
         self.h = h_new.detach()
-        return x + h_new
+        #return x + h_new
+        out=F.pad(x, (0, 0, 0, 0, 0, h_new.shape[1] - x.shape[1], 0, 0)) + h_new
+        out = torch.clamp(out, -1, 1)
+        return out
 
 
 class InverseConv(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, in_channels, out_channels):
         super(InverseConv, self).__init__()
-        self.conv = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         nn.init.zeros_(self.conv.weight)
         nn.init.zeros_(self.conv.bias)
 
@@ -65,7 +72,9 @@ class InverseConv(nn.Module):
         # Clip weights to [-1, 1]
         self.conv.weight.data.clamp_(-1, 1)
         # Skip connection
-        return x + out
+        out = x[:, :out.shape[1]] + out
+        out = torch.clamp(out, -1, 1)
+        return out
 
 
 def normalize_image(image):
@@ -155,24 +164,25 @@ def channel_ordering_loss(layer):
     return loss
 
 
-class PyramidCompressionNet(nn.Module):
+class StripEncoder2D(nn.Module):
     def __init__(self, image_size, in_channels=3, hidden_channels=9, num_pyramid_levels=None, quality=0.98, top_p=0.02,
                  order_weight=0.001):
-        super(PyramidCompressionNet, self).__init__()
+        super(StripEncoder2D, self).__init__()
         self.quality = quality
-        self.image_size = image_size
-        resolutions, levels = calc_image_pyramid_from_resolution(image_size)
+        self.image_size = list(reversed(image_size))  # sane width x height to HW for NHWC
+        resolutions, levels = calc_image_pyramid_from_resolution(self.image_size)
         self.num_pyramid_levels = num_pyramid_levels if num_pyramid_levels is not None else levels
         self.recurrent_cnns = nn.ModuleList([
             RecurrentCNN(in_channels, hidden_channels, resolutions[l])
             for l in range(self.num_pyramid_levels)
         ])
         self.inverse_convs = nn.ModuleList([
-            InverseConv(hidden_channels)
+            InverseConv(hidden_channels, in_channels)
             for _ in range(self.num_pyramid_levels)
         ])
         self.top_p = top_p
         self.order_weight = order_weight
+        self.in_channels = in_channels
 
     def forward(self, x):
         x = normalize_image(x)
@@ -184,7 +194,7 @@ class PyramidCompressionNet(nn.Module):
         # Apply sparsity to compressed_pyramid
         sparse_pyramid = []
         for compressed_level, h in zip(compressed_pyramid, self.recurrent_cnns):
-            threshold = h.h[:, 0:1, :, :]  # Use first channel of hidden state as threshold
+            threshold = h.h[:, self.in_channels:self.in_channels+1, :, :]  # Use first non-skip channel of hidden state as threshold
             sparse_level = torch.where(compressed_level >= threshold, compressed_level,
                                        torch.zeros_like(compressed_level))
             sparse_pyramid.append(sparse_level)
@@ -192,12 +202,16 @@ class PyramidCompressionNet(nn.Module):
         reconstructed = torch.zeros_like(x)
         for l in range(self.num_pyramid_levels):
             recon = self.inverse_convs[l](sparse_pyramid[l])
-            recon = F.interpolate(recon, size=self.image_size, mode='bilinear')
+            recon = F.interpolate(recon, size=tuple(self.image_size), mode='bilinear')
             reconstructed += recon
+        reconstructed /= self.num_pyramid_levels
+
 
         kl_losses = sum(topk_percentage_loss(level, self.top_p) for level in sparse_pyramid)
         order_loss = sum(channel_ordering_loss(level) for level in sparse_pyramid)
         reproduction_loss = F.mse_loss(reconstructed, x)
+
+        reconstructed = torch.clamp(reconstructed, 0, 1)
 
         # Combine losses with the given quality ratio
         total_loss = self.quality * reproduction_loss + (1 - self.quality) * kl_losses + order_loss * self.order_weight
@@ -206,47 +220,44 @@ class PyramidCompressionNet(nn.Module):
         reversed_hidden = list(reversed(sparse_pyramid))
         unrolled = [level.view(level.shape[0], -1) for level in reversed_hidden]
         concatenated = torch.cat(unrolled, dim=1)
-        sp = csr_matrix(concatenated.cpu().numpy())
+        sp = csr_matrix(concatenated.detach().cpu().numpy())
         sparse_h = torch.sparse_csr_tensor(sp.indptr, sp.indices, sp.data)
 
         # Image pyramid info for potential reconstruction
         pyramid_info = [(level.shape[1], level.shape[2], level.shape[3]) for level in sparse_pyramid]
 
-        return sparse_h, pyramid_info, total_loss
+        return sparse_h, pyramid_info, total_loss, reconstructed
 
 
 if __name__ == '__main__':
     import time
     from torch import optim
     from stripencode.webcam_capture import WebcamCapture
+    import cv2
+    import numpy as np
 
-    resolution = (1280, 720)
+    resolution = (640, 360)
 
     # Initialize model, optimizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = PyramidCompressionNet(in_channels=3, hidden_channels=16, image_size=resolution).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=5e-6)  # Smaller LR for longer training cycles
+    model = StripEncoder2D(in_channels=3, hidden_channels=5, image_size=resolution).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=5e-3)  # Smaller LR for longer training cycles
 
     # Training loop with while loop (user can exit with Ctrl + C)
     step = 0
     try:
-        print('0')
         with WebcamCapture(*resolution, 0) as webcam:
             while True:
                 start_time = time.time()
-                print('1')
 
                 frame_tensor = webcam.get_frame(resolution)
-                print('2')
 
                 image = frame_tensor.to(device)
-                sparse_h, pyramid_info, loss = model(image)
-                print('3')
+                sparse_h, pyramid_info, loss, reproduction = model(image)
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                print('4')
 
                 # Compute memory savings
                 original_size = image.element_size() * image.nelement()  # Uncompressed tensor size
@@ -254,8 +265,12 @@ if __name__ == '__main__':
                 compression_ratio = sparse_size / original_size
 
                 print(
-                    f"Step {step} | Loss: {loss.item():.6f} | Compression Ratio: {compression_ratio:.4f} | Time per step: {time.time() - start_time:.3f}s")
+                    f"Step {step} | Loss: {loss.item():.6f} | Compression Ratio: {compression_ratio:.4f}'{sparse_h._nnz()} | Time per step: {time.time() - start_time:.3f}s")
 
+                o = (frame_tensor.detach().cpu().squeeze(0).permute(1,2,0).numpy()*255).astype(np.uint8)
+                r = (reproduction.detach().cpu().squeeze(0).permute(1,2,0).numpy()*255).astype(np.uint8)
+                cv2.imshow("Original | Reproduction", np.hstack([o, r]))
+                cv2.waitKey(1)
                 step += 1
 
     except KeyboardInterrupt:
