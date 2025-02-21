@@ -165,40 +165,51 @@ def channel_ordering_loss(layer):
 
 
 class StripEncoder2D(nn.Module):
-    def __init__(self, image_size, in_channels=3, hidden_channels=9, num_pyramid_levels=None, quality=0.98, top_p=0.02,
+    def __init__(self, image_size, in_channels=3, downlayer_com_channels=1, recurrent_hidden_channels=2, num_pyramid_levels=None, quality=0.80, top_p=0.02,
                  order_weight=0.001):
         super(StripEncoder2D, self).__init__()
+        adaptive_thresh_channels = 1
         self.quality = quality
         self.image_size = list(reversed(image_size))  # sane width x height to HW for NHWC
-        resolutions, levels = calc_image_pyramid_from_resolution(self.image_size)
+        self.resolutions, levels = calc_image_pyramid_from_resolution(self.image_size)
         self.num_pyramid_levels = num_pyramid_levels if num_pyramid_levels is not None else levels
         self.recurrent_cnns = nn.ModuleList([
-            RecurrentCNN(in_channels, hidden_channels, resolutions[l])
+            RecurrentCNN(in_channels, in_channels+adaptive_thresh_channels+downlayer_com_channels+recurrent_hidden_channels, self.resolutions[l])
             for l in range(self.num_pyramid_levels)
         ])
         self.inverse_convs = nn.ModuleList([
-            InverseConv(hidden_channels-1, in_channels)
+            InverseConv(in_channels+recurrent_hidden_channels, in_channels)
             for _ in range(self.num_pyramid_levels)
         ])
         self.top_p = top_p
         self.order_weight = order_weight
         self.in_channels = in_channels
+        self.adaptive_thresh_channels = adaptive_thresh_channels
+        self.downlayer_com_channels=downlayer_com_channels
+        self.recurrent_hidden_channels = recurrent_hidden_channels
 
     def forward(self, x):
         x = normalize_image(x)
         pyr, levels = create_image_pyramid(x, self.num_pyramid_levels)
         compressed_pyramid = []
+        h_com_out = None
         for l in range(self.num_pyramid_levels):
+            if h_com_out is not None:
+                h_com_in = F.interpolate(h_com_out, size=tuple(self.resolutions[l]), mode='bilinear')
+                if self.recurrent_cnns[l].h.device != x.device:
+                    self.recurrent_cnns[l].h = self.recurrent_cnns[l].h.to(x.device)
+                self.recurrent_cnns[l].h[:, self.in_channels+self.adaptive_thresh_channels:self.in_channels+self.adaptive_thresh_channels+self.downlayer_com_channels, ...] += h_com_in
             h = self.recurrent_cnns[l](pyr[l])
+            h_com_out = h[:, self.in_channels+self.adaptive_thresh_channels:self.in_channels+self.adaptive_thresh_channels+self.downlayer_com_channels, ...]
             compressed_pyramid.append(h)
         # Apply sparsity to compressed_pyramid
         sparse_pyramid = []
         for compressed_level, h in zip(compressed_pyramid, self.recurrent_cnns):
-            threshold = h.h[:, self.in_channels:self.in_channels+1, :, :]  # Use first non-skip channel of hidden state as threshold
+            threshold = h.h[:, self.in_channels:self.in_channels+self.adaptive_thresh_channels, :, :]  # Use first non-skip channel of hidden state as threshold
             sparse_level = torch.where(compressed_level >= threshold, compressed_level,
                                        torch.zeros_like(compressed_level))
             #sparse_pyramid.append(sparse_level)
-            sparse_pyramid.append(torch.cat((sparse_level[:, :self.in_channels, ...], sparse_level[:, self.in_channels+1:, ...]), 1))
+            sparse_pyramid.append(torch.cat((sparse_level[:, :self.in_channels, ...], sparse_level[:, self.in_channels+self.adaptive_thresh_channels+self.downlayer_com_channels:, ...]), 1))
 
         reconstructed = torch.zeros_like(x)
         for l in range(self.num_pyramid_levels):
@@ -241,8 +252,8 @@ if __name__ == '__main__':
 
     # Initialize model, optimizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = StripEncoder2D(in_channels=3, hidden_channels=6, image_size=resolution).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=5e-3)  # Smaller LR for longer training cycles
+    model = StripEncoder2D(in_channels=3, downlayer_com_channels=1, recurrent_hidden_channels=2, image_size=resolution).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=5e-3)  # Smaller LR for longer training cycles
 
     # Training loop with while loop (user can exit with Ctrl + C)
     step = 0
@@ -262,7 +273,7 @@ if __name__ == '__main__':
 
                 # Compute memory savings
                 original_size = image.element_size() * image.nelement()  # Uncompressed tensor size
-                sparse_size = sparse_h._nnz() * sparse_h.element_size()  # Only non-zero elements
+                sparse_size = 2*sparse_h._nnz() * sparse_h.element_size()  # Only non-zero elements, *2 because indices
                 compression_ratio = sparse_size / original_size
 
                 print(
