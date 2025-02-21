@@ -177,7 +177,7 @@ class StripEncoder2D(nn.Module):
             for l in range(self.num_pyramid_levels)
         ])
         self.inverse_convs = nn.ModuleList([
-            InverseConv(hidden_channels, in_channels)
+            InverseConv(hidden_channels-1, in_channels)
             for _ in range(self.num_pyramid_levels)
         ])
         self.top_p = top_p
@@ -197,7 +197,8 @@ class StripEncoder2D(nn.Module):
             threshold = h.h[:, self.in_channels:self.in_channels+1, :, :]  # Use first non-skip channel of hidden state as threshold
             sparse_level = torch.where(compressed_level >= threshold, compressed_level,
                                        torch.zeros_like(compressed_level))
-            sparse_pyramid.append(sparse_level)
+            #sparse_pyramid.append(sparse_level)
+            sparse_pyramid.append(torch.cat((sparse_level[:, :self.in_channels, ...], sparse_level[:, self.in_channels+1:, ...]), 1))
 
         reconstructed = torch.zeros_like(x)
         for l in range(self.num_pyramid_levels):
@@ -240,7 +241,7 @@ if __name__ == '__main__':
 
     # Initialize model, optimizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = StripEncoder2D(in_channels=3, hidden_channels=5, image_size=resolution).to(device)
+    model = StripEncoder2D(in_channels=3, hidden_channels=6, image_size=resolution).to(device)
     optimizer = optim.Adam(model.parameters(), lr=5e-3)  # Smaller LR for longer training cycles
 
     # Training loop with while loop (user can exit with Ctrl + C)
