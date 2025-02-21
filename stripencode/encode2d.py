@@ -2,8 +2,6 @@ import torch.nn.functional as F
 import math
 import torch
 from torch import nn
-from scipy.sparse import csr_matrix
-
 
 def create_image_pyramid(x, num_levels=None, mode='bilinear'):
     """
@@ -51,6 +49,8 @@ class RecurrentCNN(nn.Module):
             self.h = self.h.to(x.device)
         x_h = torch.cat([x, self.h], dim=1)
         h_new = self.conv(x_h)
+        self.conv.weight.data.clamp_(-2, 2)
+        self.conv.bias.data.clamp_(-2, 2)
         h_new = self.leaky_relu(h_new)
         h_new = torch.clamp(h_new, -1, 1)
         self.h = h_new.detach()
@@ -70,7 +70,8 @@ class InverseConv(nn.Module):
     def forward(self, x):
         out = self.conv(x)
         # Clip weights to [-1, 1]
-        self.conv.weight.data.clamp_(-1, 1)
+        self.conv.weight.data.clamp_(-2, 2)
+        self.conv.bias.data.clamp_(-2, 2)
         # Skip connection
         out = x[:, :out.shape[1]] + out
         out = torch.clamp(out, -1, 1)
@@ -165,7 +166,7 @@ def channel_ordering_loss(layer):
 
 
 class StripEncoder2D(nn.Module):
-    def __init__(self, image_size, in_channels=3, downlayer_com_channels=1, recurrent_hidden_channels=2, num_pyramid_levels=None, quality=0.80, top_p=0.02,
+    def __init__(self, image_size, in_channels=3, downlayer_com_channels=3, recurrent_hidden_channels=2, num_pyramid_levels=None, quality=0.80, top_p=0.02,
                  order_weight=0.001):
         super(StripEncoder2D, self).__init__()
         adaptive_thresh_channels = 1
@@ -198,7 +199,7 @@ class StripEncoder2D(nn.Module):
                 h_com_in = F.interpolate(h_com_out, size=tuple(self.resolutions[l]), mode='bilinear')
                 if self.recurrent_cnns[l].h.device != x.device:
                     self.recurrent_cnns[l].h = self.recurrent_cnns[l].h.to(x.device)
-                self.recurrent_cnns[l].h[:, self.in_channels+self.adaptive_thresh_channels:self.in_channels+self.adaptive_thresh_channels+self.downlayer_com_channels, ...] += h_com_in
+                self.recurrent_cnns[l].h[:, self.in_channels+self.adaptive_thresh_channels:self.in_channels+self.adaptive_thresh_channels+self.downlayer_com_channels, ...] = h_com_in
             h = self.recurrent_cnns[l](pyr[l])
             h_com_out = h[:, self.in_channels+self.adaptive_thresh_channels:self.in_channels+self.adaptive_thresh_channels+self.downlayer_com_channels, ...]
             compressed_pyramid.append(h)
@@ -232,8 +233,16 @@ class StripEncoder2D(nn.Module):
         reversed_hidden = list(reversed(sparse_pyramid))
         unrolled = [level.view(level.shape[0], -1) for level in reversed_hidden]
         concatenated = torch.cat(unrolled, dim=1)
-        sp = csr_matrix(concatenated.detach().cpu().numpy())
-        sparse_h = torch.sparse_csr_tensor(sp.indptr, sp.indices, sp.data)
+        #sp = csr_matrix(concatenated.detach().cpu().numpy())
+        sparse_h = concatenated.to_sparse_csr()
+        # force int32 because int64 is too big even for us
+        crow = sparse_h.crow_indices().to(torch.int32)
+        col = sparse_h.col_indices().to(torch.int32)
+        values = sparse_h.values()
+        # Reconstruct the sparse CSR tensor with int32 indices:
+        sparse_h = torch.sparse_csr_tensor(crow, col, values, size=sparse_h.size())
+
+        #sparse_h = torch.sparse_csr_tensor(sp.indptr, sp.indices, sp.data)
 
         # Image pyramid info for potential reconstruction
         pyramid_info = [(level.shape[1], level.shape[2], level.shape[3]) for level in sparse_pyramid]
@@ -252,7 +261,7 @@ if __name__ == '__main__':
 
     # Initialize model, optimizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = StripEncoder2D(in_channels=3, downlayer_com_channels=1, recurrent_hidden_channels=2, image_size=resolution).to(device)
+    model = StripEncoder2D(in_channels=3, downlayer_com_channels=3, recurrent_hidden_channels=2, image_size=resolution).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=5e-3)  # Smaller LR for longer training cycles
 
     # Training loop with while loop (user can exit with Ctrl + C)
@@ -273,11 +282,11 @@ if __name__ == '__main__':
 
                 # Compute memory savings
                 original_size = image.element_size() * image.nelement()  # Uncompressed tensor size
-                sparse_size = 2*sparse_h._nnz() * sparse_h.element_size()  # Only non-zero elements, *2 because indices
+                sparse_size = sparse_h.col_indices().numel()*sparse_h.col_indices().element_size()+ sparse_h.values().numel()*sparse_h.values().element_size()  # Only non-zero elements, *2 because indices
                 compression_ratio = sparse_size / original_size
 
                 print(
-                    f"Step {step} | Loss: {loss.item():.6f} | Compression Ratio: {compression_ratio:.4f}'{sparse_h._nnz()} | Time per step: {time.time() - start_time:.3f}s")
+                    f"Step {step} | Loss: {loss.item():.6f} | Compression Ratio: {compression_ratio:.4f}'{sparse_h._nnz()}/{image.numel()} | Time per step: {time.time() - start_time:.3f}s")
 
                 o = (frame_tensor.detach().cpu().squeeze(0).permute(1,2,0).numpy()*255).astype(np.uint8)
                 r = (reproduction.detach().cpu().squeeze(0).permute(1,2,0).numpy()*255).astype(np.uint8)

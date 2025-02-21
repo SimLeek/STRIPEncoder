@@ -11,8 +11,9 @@ class WebcamCapture:
     def __enter__(self):
         self.cap = cv2.VideoCapture(self.device)
         # weird gstreamer bug. cap fails if these are specified
-        #self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
-        #self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.CAP_OPENCV_MJPEG)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
 
         return self
 
